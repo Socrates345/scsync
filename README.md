@@ -13,13 +13,10 @@ uv sync --dev
 ```
 
 ```python
-python -m venv .venv
 . .\.venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip
 pipx install scdl
 pipx upgrade scdl
-uv sync --dev
-
 uv sync --upgrade-package yt-dlp
 ```
 
@@ -38,10 +35,6 @@ pytest
 
 scdl new safety instruction: every single deletion of a song must be human in the loop/approved!
 because I have added a lot of songs to playlists manually + create a trackinf list of songs that are not in soundcloud playlist for each playlist
-
-
-
-
 
 
 

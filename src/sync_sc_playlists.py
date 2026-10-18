@@ -900,13 +900,8 @@ def _finalize(result: RunResult, unattended: bool = False) -> int:
         print("\nTo try recovering failed tracks via YouTube, run: python src/retry_failed_with_ytdl.py <playlist>")
         return 1
 
-    try:
-        answer = input("\nWant to try recovering failed tracks via YouTube instead? [y/N] ").strip().lower()
-    except (EOFError, KeyboardInterrupt):
-        answer = ""
-
-    if answer == "y":
-        _run_youtube_retry(result.failed)
+    print("\nTrying to recover failed tracks via YouTube...")
+    _run_youtube_retry(result.failed)
 
     return 1
 
