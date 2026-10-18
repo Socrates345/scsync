@@ -1,0 +1,33 @@
+[ytdl]
+# Browser to extract YouTube cookies from.
+# Supported values: brave, chrome, chromium, edge, firefox, opera, safari, vivaldi, whale
+# For LibreWolf (Firefox-based), use: firefox:PATH_TO_LIBREWOLF_PROFILE
+# Profile is typically at: %APPDATA%\librewolf\Profiles\<profile-name>
+#
+# Example:
+# cookies_from_browser = firefox:C:\Users\YOU\AppData\Roaming\librewolf\Profiles\xxxxxxxx.default-default
+#
+# Leave empty to download without authentication (public playlists only):
+# cookies_from_browser =
+
+cookies_from_browser =
+
+# Download directory for YouTube audio playlists (used by ytdl.py and sync_yt_playlists.py).
+# Relative paths are resolved from the project root (where ytdl.py lives).
+# Example:
+# path = playlists\yt
+
+path =
+
+# Download directory for YouTube video playlists (used when --video flag is passed).
+# Example:
+# video_path = playlists\yt-video
+
+video_path =
+
+# Max video height for --video downloads (360, 480, 720, 1080, ...), or "best" for no cap.
+# Overridden per run by --res. Leave empty for the built-in default (360).
+# Example:
+# video_res = 720
+
+video_res =

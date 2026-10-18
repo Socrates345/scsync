@@ -1,6 +1,0 @@
-pytest
-music-tag
-ruff
-mypy
-types-requests
-types-tqdm

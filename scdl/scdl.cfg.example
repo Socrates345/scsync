@@ -1,0 +1,8 @@
+[scdl]
+client_id = 
+auth_token = 
+path = playlists/sc
+name_format = [%(id)s] %(uploader)s - %(title)s.%(ext)s
+playlist_name_format = %(uploader)s - %(title)s.%(ext)s
+yt_dlp_args = --match-filters duration>30
+
