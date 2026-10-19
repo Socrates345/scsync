@@ -64,7 +64,7 @@ At the end of a run it:
 - lists playlists the quick check didn't recognize, with the `--force-all --only ...` command to run
 - deletes empty files in `archive_trackers/sc` (also `python src/cleanup_empty_archives.py`)
 
-Exit codes: `0` all good, `1` something needs your attention (failed, dead link, needs a full sync), `75` another sync is already running.
+Exit codes: `0` success (some tracks may have failed, e.g. geo-blocked), `1` something needs your attention (a playlist failed, dead link, needs a full sync), `75` another sync is already running.
 
 ### One playlist, track or user
 

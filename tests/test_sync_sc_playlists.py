@@ -196,9 +196,83 @@ def test_alert_text_has_no_identifiers():
 
 def test_alert_text_quiet_cases():
     title, body, tags = ssp._alert_text(ssp.RunResult(downloaded=1), {})
-    assert (title, body, tags) == ("SC sync", "1 new track", "musical_note")
+    assert (title, body, tags) == ("SC sync: success", "1 new track", "musical_note")
     _, body, _ = ssp._alert_text(ssp.RunResult(), {}, failures_cleared=True)
-    assert body == "Earlier failures cleared"
+    assert body == "No new tracks\nEarlier failures cleared"
+
+
+def test_alert_track_errors_are_still_a_success():
+    u = _SECRET_URLS
+    line_of = {x: i for i, x in enumerate(u, 1)}
+    result = ssp.RunResult(
+        downloaded=3,
+        new_tracks={u[1]: 3},
+        track_errors={u[3]: 1, u[0]: 4},
+        titles={u[0]: "Metal", u[1]: "Rap FR"},
+    )
+    title, body, tags = ssp._alert_text(result, line_of, ytdlp_hint="yt-dlp is old")
+    assert title == "SC sync: success"
+    assert tags == "musical_note"
+    assert body == (
+        "3 new tracks:\n- Rap FR: 3\n"
+        "5 tracks couldn't be downloaded (see logs):\n- Metal: 4\n- line 4: 1\n"
+        "yt-dlp is old"
+    )
+    for leak in ("zq9user", "secret-mix", "tokenXYZ", "AbC", "deadbeef", "soundcloud", "http"):
+        assert leak not in body
+
+    title, body, tags = ssp._alert_text(
+        ssp.RunResult(track_errors={u[0]: 1}, titles={u[0]: "Metal"}), line_of)
+    assert (title, tags) == ("SC sync: success", "white_check_mark")
+    assert body == "No new tracks\n1 track couldn't be downloaded (see logs):\n- Metal: 1"
+
+
+def _scripted_proc(lines: list[str], returncode: int):
+    class Proc:
+        def __init__(self, *_args, **_kwargs) -> None:
+            self.stdout = iter(lines)
+            self.returncode = returncode
+
+        def wait(self) -> int:
+            return returncode
+
+    return Proc
+
+
+_GEO = "ERROR: [soundcloud] This video is not available from your location due to geo restriction\n"
+_SCDL_TRACK_ERRORS = [
+    "[download] Downloading playlist: Metal Classics\n",
+    "[download] Destination: a.m4a\n",
+    _GEO,
+    _GEO,
+    "[download] Finished downloading playlist: Metal Classics\n",
+]
+
+
+def test_track_errors_in_a_synced_playlist_are_not_a_failure(playlist, monkeypatch):
+    monkeypatch.setattr(ssp, "_fetch_ids_at", _fetch(["1", "2", "3"], ["6"]))
+    monkeypatch.setattr(ssp.subprocess, "Popen", _scripted_proc(_SCDL_TRACK_ERRORS, 1))
+    result = ssp.sync_list([playlist], 0, 5, force_all=False, unattended=True)
+    assert result.failed == []
+    assert result.track_errors == {playlist: 2}
+    assert result.new_tracks == {playlist: 1}
+    assert result.titles == {playlist: "Metal Classics"}
+
+
+def test_playlist_that_did_not_finish_is_a_failure(playlist, monkeypatch):
+    unfinished = [line for line in _SCDL_TRACK_ERRORS if "Finished" not in line]
+    monkeypatch.setattr(ssp, "_fetch_ids_at", _fetch(["1", "2", "3"], ["6"]))
+    monkeypatch.setattr(ssp.subprocess, "Popen", _scripted_proc(unfinished, 1))
+    result = ssp.sync_list([playlist], 0, 5, force_all=False, unattended=True)
+    assert result.failed == [playlist]
+    assert result.track_errors == {}
+
+
+def test_finalize_track_errors_only_exits_0(playlist, monkeypatch, tmp_path):
+    monkeypatch.setattr(ssp, "STATE_FILE", tmp_path / "state.json")
+    result = ssp.RunResult(track_errors={playlist: 2}, titles={playlist: "Metal"})
+    assert ssp._finalize(result, unattended=True) == 0
+    assert ssp._finalize(ssp.RunResult(failed=[playlist]), unattended=True) == 1
 
 
 def test_line_labels():
@@ -221,15 +295,40 @@ def test_repeat_failures_alert_once(tmp_path, monkeypatch, playlist):
     ran = [playlist]
     ssp._alert_result(ssp.RunResult(failed=[playlist]), ran, ffmpeg_missing=False)
     ssp._alert_result(ssp.RunResult(failed=[playlist]), ran, ffmpeg_missing=False)
-    assert sent == ["Failed: line 1 (see logs)"]
+    assert sent == ["No new tracks\nFailed: line 1 (see logs)"]
     ssp._alert_result(ssp.RunResult(), ran, ffmpeg_missing=False)
     ssp._alert_result(ssp.RunResult(), ran, ffmpeg_missing=False)
-    assert sent[1:] == ["Earlier failures cleared"]
+    assert sent[1:] == ["No new tracks\nEarlier failures cleared"]
     # a run that didn't include the failing playlist doesn't clear it
     ssp._alert_result(ssp.RunResult(failed=[playlist]), ran, ffmpeg_missing=False)
     ssp._alert_result(ssp.RunResult(), [], ffmpeg_missing=False)
     ssp._alert_result(ssp.RunResult(failed=[playlist]), ran, ffmpeg_missing=False)
     assert len(sent) == 3
+
+
+def test_repeat_track_errors_alert_once(tmp_path, monkeypatch, playlist):
+    monkeypatch.setattr(ssp, "ytdlp_update_hint", lambda: None)
+    last = tmp_path / "last.json"
+    last.write_text('{"failed": []}', encoding="utf-8")  # file from before track_errors existed
+    monkeypatch.setattr(ssp, "LAST_RUN_FILE", last)
+    sent: list[tuple[str, str]] = []
+
+    def notify(title, body, _tags=""):
+        sent.append((title, body))
+        return True
+
+    monkeypatch.setattr(ssp, "_notify", notify)
+    ran = [playlist]
+
+    def geo_blocked():
+        return ssp.RunResult(track_errors={playlist: 2}, titles={playlist: "Metal"})
+
+    ssp._alert_result(geo_blocked(), ran, ffmpeg_missing=False)
+    ssp._alert_result(geo_blocked(), ran, ffmpeg_missing=False)
+    assert sent == [("SC sync: success", "No new tracks\n2 tracks couldn't be downloaded (see logs):\n- Metal: 2")]
+    # the same playlist now failing outright is a change
+    ssp._alert_result(ssp.RunResult(failed=[playlist]), ran, ffmpeg_missing=False)
+    assert sent[-1][0] == "SC sync: action needed"
 
 
 def test_read_env(tmp_path):

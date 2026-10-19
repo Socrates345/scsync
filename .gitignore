@@ -25,7 +25,6 @@ playlists-list.md
 yt-playlists.md
 yt-video-playlists.md
 ytdl.cfg
-scdl/scdl.cfg
 best-sample-sources.md
 sc-playlists-list.md
 Songs to download manually.txt
@@ -35,3 +34,4 @@ src/videos_bulk.txt
 logs/
 .sync.lock
 .sync-last.json
+scdl/scdl.cfg

@@ -72,7 +72,7 @@ The playlists sync automatically every day at 18:00 on the Windows laptop via Ta
   - all output goes to `logs/sc-sync_<date>_<time>.log` (newest 30 kept), headed by the resolved python / scdl / ffmpeg paths; no progress bar, no automatic YouTube retry of failed tracks (manual runs do it at the end without asking)
   - **never full-syncs a playlist that already has an archive**: `_MISMATCH` is reported as "needs a manual full sync" (with the `--force-all --only <lines>` command), `_SCAN_FAILED` as failed and retried next run. 3 scan failures in a row stop the run (offline / blocked). New playlists (empty archive) still get their first full sync.
   - keeps Windows from idle-sleeping while it runs (`SetThreadExecutionState`)
-- **Alerts**: ntfy POST to `SC_NOTIFY_URL` (env var or `.env`; use a random topic of its own). Text is counts + line numbers + fixed wording only — never usernames, links, slugs, track names or exception messages — because it passes through ntfy's server. Sent when there are new tracks, a stale link, a needs-full-sync playlist, missing ffmpeg, a crash, or when the set of failing playlists changed since the last unattended run (`.sync-last.json`), so a track that keeps failing alerts once rather than daily. Silent when nothing changed.
+- **Alerts**: ntfy POST to `SC_NOTIFY_URL` (env var or `.env`; use a random topic of its own). Text is counts + line numbers + SoundCloud playlist titles (as scdl prints them, `Downloading playlist: <title>`) + fixed wording only — never usernames, links, slugs, track names or exception messages — because it passes through ntfy's server. Title is `SC sync: success` unless a playlist needs action (`SC sync: action needed`: stale link, needs-full-sync, a playlist that didn't sync, missing ffmpeg). The body always starts with the new-track count, broken down per playlist. Tracks that failed inside a playlist scdl got through to the end (geo-blocked etc., `RunResult.track_errors`) are listed per playlist but still count as success. Sent when there are new tracks, a stale link, a needs-full-sync playlist, missing ffmpeg, a crash, or when the set of failing playlists or of playlists with failed tracks changed since the last unattended run (`.sync-last.json`), so a track that keeps failing alerts once rather than daily. Silent when nothing changed.
 - `--force-all` stays manual: removed-track detection (`[unsync]`) only happens when the user runs it and can check the result. Files the user added to playlist folders that aren't in an archive are never touched by the sync (a playlist rename moves the whole folder, those included).
 
 ```powershell
@@ -117,7 +117,7 @@ For each URL:
 
 `--force-all` disables the fast-path and runs a full scdl sync for every playlist — the way to detect removed tracks (`[unsync]`). Manual runs also full-sync a playlist on `_MISMATCH`/`_SCAN_FAILED`, which can mark `[unsync]` too.
 
-Every run (manual or scheduled) takes an OS lock on `.sync.lock`; a second run exits with code 75. Exit codes: 0 all good, 1 something needs attention (failed / stale / needs a manual full sync), 75 another sync is running.
+Every run (manual or scheduled) takes an OS lock on `.sync.lock`; a second run exits with code 75. Exit codes: 0 success (individual tracks may have failed, e.g. geo-blocked), 1 something needs attention (a playlist failed / stale / needs a manual full sync), 75 another sync is running.
 
 ### Data Layout
 
