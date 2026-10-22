@@ -292,6 +292,11 @@ def _fast_path(url: str, force_all: bool = False) -> str | int:
 # ---------------------------------------------------------------------------
 
 _STALE_MARKER = "Stale playlist URL"  # logged by SyncDownloadHelper.post_download
+# Logged by SnipDetectionPP right after a "[download] Destination:" line, when the file
+# turned out to be a 30s GO+ preview and was deleted. Not a new track: it's left out of
+# the archive (and listed in .failed as [FAIL] for the YouTube retry), so it comes back
+# on every run until recovered.
+_SNIP_START = "[SnipDetection] Discarding"
 
 _SHOW_STARTS = ("ERROR:", "WARNING:")
 _SHOW_IN = ("[download] Destination:", "Playlist renamed", _STALE_MARKER)
@@ -354,7 +359,7 @@ def _scdl_exe() -> str:
 
 def _no_run(**flags) -> dict:
     """stats for a playlist where scdl was not started."""
-    return {"downloaded": 0, "skipped": True, "stale": False,
+    return {"downloaded": 0, "snips": 0, "skipped": True, "stale": False,
             "needs_full": False, "scan_failed": False, "title": None, "finished": False, **flags}
 
 
@@ -371,8 +376,10 @@ def run_scdl(
 ) -> tuple[bool, bool, bool, list[str], dict]:
     """
     Returns (success, aborted, is_conn_error, error_lines, stats).
-    stats: {"downloaded": int, "skipped": bool, "stale": bool,
+    stats: {"downloaded": int, "snips": int, "skipped": bool, "stale": bool,
             "needs_full": bool, "scan_failed": bool, "title": str | None, "finished": bool}
+      downloaded: new tracks kept. snips: GO+ previews downloaded then discarded
+        (not counted in downloaded; they're tracks that couldn't be downloaded).
       skipped=True means scdl was not run (nothing new, or one of the flags below).
       stale=True means the link is dead (404 / 0 tracks) and needs replacing.
       needs_full=True (unattended only): the quick check didn't recognise the playlist;
@@ -424,6 +431,7 @@ def run_scdl(
     is_conn_error = False
     error_lines: list[str] = []
     downloaded = 0
+    snips = 0
     stale = False
     title: str | None = None
     finished = False
@@ -462,6 +470,8 @@ def run_scdl(
 
         if "[download] Destination:" in line:
             downloaded += 1
+        if line.startswith(_SNIP_START):
+            snips += 1
 
         if _show(line):
             write(line.rstrip())
@@ -469,7 +479,7 @@ def run_scdl(
     proc.wait()
     success = proc.returncode == 0 and not has_error
     return success, aborted, is_conn_error, error_lines, {
-        "downloaded": downloaded, "skipped": False, "stale": stale,
+        "downloaded": max(downloaded - snips, 0), "snips": snips, "skipped": False, "stale": stale,
         "needs_full": False, "scan_failed": False, "title": title,
         "finished": finished and not aborted,
     }
@@ -532,6 +542,8 @@ def sync_list(
                 parts: list[str] = []
                 if stats["downloaded"]:
                     parts.append(f"{stats['downloaded']} downloaded")
+                if stats["snips"]:
+                    parts.append(f"{stats['snips']} GO+ preview(s) discarded")
                 if error_lines:
                     parts.append(f"{len(error_lines)} error(s)")
                 if stats["stale"]:
@@ -547,11 +559,11 @@ def sync_list(
                 result.stale.append(url)
             elif stats["needs_full"]:
                 result.needs_full.append(url)
-            elif not ok:
-                if stats["finished"] and error_lines and not is_conn_error:
-                    result.track_errors[url] = len(error_lines)
-                else:
-                    result.failed.append(url)
+            elif not ok and not (stats["finished"] and error_lines and not is_conn_error):
+                result.failed.append(url)
+            elif error_lines or stats["snips"]:
+                # The playlist synced; only some tracks didn't (geo-blocked, GO+ only, ...).
+                result.track_errors[url] = len(error_lines) + stats["snips"]
 
             scan_fail_streak = scan_fail_streak + 1 if stats["scan_failed"] else 0
             stop = is_conn_error or scan_fail_streak >= _SCAN_FAIL_LIMIT
@@ -955,7 +967,7 @@ def _finalize(result: RunResult, unattended: bool = False) -> int:
         _report_needs_full(result.needs_full)
     if result.track_errors:
         k = sum(result.track_errors.values())
-        print(f"\n{k} track(s) couldn't be downloaded (geo-blocked, removed, ...). The playlists themselves synced:")
+        print(f"\n{k} track(s) couldn't be downloaded (geo-blocked, GO+ only, removed, ...). The playlists themselves synced:")
         for u, n in result.track_errors.items():
             print(f"  {name(u)}: {n}")
     if result.failed:

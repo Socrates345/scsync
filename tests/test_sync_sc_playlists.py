@@ -268,6 +268,56 @@ def test_playlist_that_did_not_finish_is_a_failure(playlist, monkeypatch):
     assert result.track_errors == {}
 
 
+def _snip(name: str) -> str:
+    return f'[SnipDetection] Discarding "{name}" — 29.8s GO+ preview snip, not the full track\n'
+
+
+_SCDL_SNIPS = [
+    "[download] Downloading playlist: Metal\n",
+    "[download] Destination: Metal\\a.mp3\n",
+    "[download] Download completed\n",
+    _snip("a.mp3"),
+    "[download] Destination: Metal\\b.m4a\n",
+    "[download] Download completed\n",
+    "[download] Destination: Metal\\c.mp3\n",
+    "[download] Download completed\n",
+    _snip("c.mp3"),
+    "[download] Finished downloading playlist: Metal\n",
+]
+
+
+def test_go_plus_previews_are_not_new_tracks(playlist, monkeypatch):
+    """A preview that SnipDetectionPP deletes comes back every run: it must not be
+    reported as a new track each day, but as a track that couldn't be downloaded
+    (which alerts only when the set of such playlists changes)."""
+    monkeypatch.setattr(ssp, "_fetch_ids_at", _fetch(["1", "2", "3"], ["6"]))
+    monkeypatch.setattr(ssp.subprocess, "Popen", _scripted_proc(_SCDL_SNIPS, 0))
+    result = ssp.sync_list([playlist], 0, 5, force_all=False, unattended=True)
+    assert result.downloaded == 1
+    assert result.new_tracks == {playlist: 1}
+    assert result.track_errors == {playlist: 2}
+    assert result.failed == []
+
+
+def test_only_go_plus_previews_means_no_new_tracks(playlist, monkeypatch):
+    only_snips = [line for line in _SCDL_SNIPS if "b.m4a" not in line]
+    monkeypatch.setattr(ssp, "_fetch_ids_at", _fetch(["1", "2", "3"], ["6"]))
+    monkeypatch.setattr(ssp.subprocess, "Popen", _scripted_proc(only_snips, 0))
+    result = ssp.sync_list([playlist], 0, 5, force_all=False, unattended=True)
+    assert result.downloaded == 0
+    assert result.new_tracks == {}
+    assert result.track_errors == {playlist: 2}
+
+
+def test_go_plus_previews_add_to_track_errors(playlist, monkeypatch):
+    lines = [*_SCDL_TRACK_ERRORS[:-1], _snip("a.m4a"), _SCDL_TRACK_ERRORS[-1]]
+    monkeypatch.setattr(ssp, "_fetch_ids_at", _fetch(["1", "2", "3"], ["6"]))
+    monkeypatch.setattr(ssp.subprocess, "Popen", _scripted_proc(lines, 1))
+    result = ssp.sync_list([playlist], 0, 5, force_all=False, unattended=True)
+    assert result.track_errors == {playlist: 3}
+    assert result.new_tracks == {}
+
+
 def test_finalize_track_errors_only_exits_0(playlist, monkeypatch, tmp_path):
     monkeypatch.setattr(ssp, "STATE_FILE", tmp_path / "state.json")
     result = ssp.RunResult(track_errors={playlist: 2}, titles={playlist: "Metal"})
