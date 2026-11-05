@@ -17,6 +17,7 @@ import argparse
 import configparser
 import logging
 import shlex
+import sys
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
 
@@ -101,7 +102,9 @@ def _archive_name(url: str) -> str:
     return "_".join(parts).lstrip("@") or "unknown"
 
 
-def download(url: str, args: argparse.Namespace) -> None:
+def download(url: str, args: argparse.Namespace) -> int:
+    """Returns yt-dlp's exit code: 0 if everything downloaded, 1 if anything failed
+    (errors are reported and the rest of a playlist still downloads)."""
     video = getattr(args, "video", False)
     base = Path(args.path).resolve()
     adir = _archive_dir(video)
@@ -184,10 +187,11 @@ def download(url: str, args: argparse.Namespace) -> None:
 
     with YoutubeDL(params) as ydl:
         sync = SyncDownloadHelper(scdl_args, ydl)
-        ydl.download([url])
+        retcode = ydl.download([url])
         sync.post_download()
         if sync._playlist_title:
             _rename_archive_with_title(Path(sync_file), sync._playlist_title)
+    return retcode
 
 
 def _resolve_cfg_path(raw: str | None, fallback: str) -> str:
@@ -247,7 +251,7 @@ def main() -> None:
     p.add_argument("--yt-dlp-args", metavar="ARGSTRING", dest="yt_dlp_args",
                    help="Extra yt-dlp arguments forwarded as-is")
     args = p.parse_args()
-    download(args.l, args)
+    sys.exit(download(args.l, args))
 
 
 if __name__ == "__main__":

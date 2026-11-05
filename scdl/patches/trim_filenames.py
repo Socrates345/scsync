@@ -46,7 +46,10 @@ def evaluate_outtmpl(self, outtmpl, info_dict, *args, trim_filename=False, **kwa
             return name.decode(encoding, "ignore")
         return name[:max_file_name]
 
-    filename = os.path.join(*map(trim_filename, Path(filename).parts or "."))
+    # An empty template means "don't write this file" (yt-dlp sets pl_thumbnail to "" for
+    # --embed-thumbnail). Path("") would turn it into ".", which wrote the playlist cover as ..jpg.
+    if filename:
+        filename = os.path.join(*map(trim_filename, Path(filename).parts or "."))
     return filename + suffix
 
 

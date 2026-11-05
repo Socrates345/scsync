@@ -845,16 +845,17 @@ def download_url(url: str, **scdl_args: Unpack[SCDLArgs]) -> None:
         if scdl_args.get("failed_log"):
             import json
 
-            def _sc_track_policy(track_id: str) -> str:
-                """Return the SoundCloud policy field for a track, or '' on failure.
+            def _sc_track_json(track_id: str) -> dict:
+                """Return SoundCloud's JSON for a track (title, user, policy, ...), or {} on failure.
                 Uses ydl's HTTP stack so proxy/DNS config matches the main download."""
                 client_id = scdl_args.get("client_id", "")
                 api_url = f"https://api-v2.soundcloud.com/tracks/{track_id}?client_id={client_id}"
                 try:
                     with ydl.urlopen(api_url) as resp:
-                        return json.loads(resp.read()).get("policy", "")
+                        data = json.loads(resp.read())
+                    return data if isinstance(data, dict) else {}
                 except Exception:
-                    return ""
+                    return {}
 
             in_playlist_folder = bool(_fl_playlist_title[0]) and not scdl_args.get("no_playlist_folder")
             dest_dir = (
@@ -869,6 +870,16 @@ def download_url(url: str, **scdl_args: Unpack[SCDLArgs]) -> None:
                 for archive_id, info in _fl_attempted.items():
                     if archive_id not in _fl_downloaded:
                         track_url = info["url"]
+                        track_id = archive_id.split()[-1]
+                        track_json: dict | None = None
+                        if not info["title"]:
+                            # Public playlists list most tracks by id only, so one that fails before
+                            # its metadata is read (DRM) has no name yet. Look it up, so the YouTube
+                            # retry searches "uploader - title" instead of the id.
+                            track_json = _sc_track_json(track_id)
+                            if track_json.get("title"):
+                                info["title"] = track_json["title"]
+                                info["uploader"] = (track_json.get("user") or {}).get("username") or ""
                         name = " - ".join(filter(None, [info["uploader"], info["title"]])) or archive_id
                         error = _fl_errors.get(archive_id, "")
 
@@ -882,8 +893,9 @@ def download_url(url: str, **scdl_args: Unpack[SCDLArgs]) -> None:
                             _fl_found[archive_id] = found_match
                             continue
                         if "HTTP Error 404" in error:
-                            track_id = archive_id.split()[-1]
-                            policy = _sc_track_policy(track_id)
+                            if track_json is None:
+                                track_json = _sc_track_json(track_id)
+                            policy = track_json.get("policy", "")
                             if policy == "SNIP":
                                 tag = "[GO+]     "
                                 error_line = ""

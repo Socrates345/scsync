@@ -19,6 +19,7 @@ from urllib.parse import urlparse
 
 from tqdm import tqdm
 
+import download_queue
 from cleanup_empty_archives import delete_empty
 from ytdlp_age import ytdlp_update_hint
 
@@ -201,8 +202,9 @@ def _archive_ids(url: str) -> set[str]:
 def _fetch_ids_at(url: str, items: str) -> list[str] | str | None:
     """
     Fetch track IDs for the given playlist-items range via yt-dlp Python API.
-    Returns a list (possibly empty if range is past end), _GONE if the playlist
-    URL itself returns 404, or None on any other error.
+    Returns a list (empty if the range is past the end, or the playlist has no
+    tracks), _GONE if the playlist URL itself returns 404, or None on any other
+    error.
 
     Uses the API directly instead of a subprocess to avoid Windows console
     output bypass (WriteConsoleW leaks through capture_output=True on Windows).
@@ -219,10 +221,11 @@ def _fetch_ids_at(url: str, items: str) -> list[str] | str | None:
         }
         with YoutubeDL(params) as ydl:
             info = ydl.extract_info(url, download=False)
-        if info:
-            for entry in info.get("entries") or []:
-                if entry and entry.get("id"):
-                    ids.append(str(entry["id"]))
+        if not info:
+            return None  # no answer at all: not proof that the playlist is empty
+        for entry in info.get("entries") or []:
+            if entry and entry.get("id"):
+                ids.append(str(entry["id"]))
         return ids
     except Exception as e:
         return _GONE if "HTTP Error 404" in str(e) else None
@@ -231,6 +234,7 @@ def _fetch_ids_at(url: str, items: str) -> list[str] | str | None:
 _FULL_SYNC = "full"
 _SKIP = "skip"
 _STALE = "stale"
+_EMPTY = "empty"
 _GONE = "gone"
 _MISMATCH = "mismatch"
 _SCAN_FAILED = "scan-failed"
@@ -241,8 +245,9 @@ def _fast_path(url: str, force_all: bool = False) -> str | int:
     Determine the sync strategy for this playlist.
 
     Returns:
-      _STALE        — link is dead (404 or 0 tracks), e.g. secret link reset or playlist
-                      made private; don't run scdl, the user needs a fresh share link
+      _STALE        — link is dead (404), e.g. secret link reset, playlist made private
+                      or deleted; don't run scdl, the user needs a fresh share link
+      _EMPTY        — the playlist exists but has no tracks: nothing to sync
       _FULL_SYNC    — run a full scdl --sync (new playlist or --force-all)
       _MISMATCH     — none of the first tracks are in the archive (reshuffled / replaced)
       _SCAN_FAILED  — a pre-scan request errored
@@ -254,7 +259,8 @@ def _fast_path(url: str, force_all: bool = False) -> str | int:
 
     Algorithm (assumes new tracks are appended to the END of the playlist):
       1. Fetch the first _SANITY_N SC track IDs (the oldest songs in the playlist).
-         404 or nothing at all → stale link. Done even for new playlists and --force-all.
+         404 → stale link; no tracks at all → empty playlist. Done even for new
+         playlists and --force-all.
       2. N = number of tracks in the local archive (= songs we already have).
          The fetched IDs should be in the archive. If none match, the playlist may have
          been replaced or drastically reshuffled → mismatch.
@@ -263,8 +269,10 @@ def _fast_path(url: str, force_all: bool = False) -> str | int:
          Yes → new songs start at N+1 → run scdl with -o N+1.
     """
     heads = _fetch_ids_at(url, f"1:{_SANITY_N}")
-    if heads == _GONE or heads == []:
+    if heads == _GONE:
         return _STALE
+    if heads == []:
+        return _EMPTY
     if not isinstance(heads, list):
         return _SCAN_FAILED
 
@@ -359,8 +367,21 @@ def _scdl_exe() -> str:
 
 def _no_run(**flags) -> dict:
     """stats for a playlist where scdl was not started."""
-    return {"downloaded": 0, "snips": 0, "skipped": True, "stale": False,
-            "needs_full": False, "scan_failed": False, "title": None, "finished": False, **flags}
+    return {"downloaded": 0, "snips": 0, "skipped": True, "stale": False, "empty": False,
+            "cleared": 0, "needs_full": False, "scan_failed": False, "title": None,
+            "finished": False, **flags}
+
+
+def _clear_archive(url: str) -> int:
+    """The playlist is empty on SoundCloud, so none of its archived tracks are in it
+    any more. Delete its archive and .failed list (the music files stay) so tracks
+    added later sync as a new playlist. Otherwise they'd look like a reshuffle
+    (needs a manual full sync), and scdl would then call the link stale because
+    none of the archived tracks are there. Returns how many tracks were dropped."""
+    dropped = len(_archive_ids(url))
+    for suffix in (".txt", ".failed"):
+        archive_path(url).with_suffix(suffix).unlink(missing_ok=True)
+    return dropped
 
 
 _PLAYLIST_TITLE_RE = re.compile(r"^\[download\] Downloading playlist: (.+)$")
@@ -376,12 +397,16 @@ def run_scdl(
 ) -> tuple[bool, bool, bool, list[str], dict]:
     """
     Returns (success, aborted, is_conn_error, error_lines, stats).
-    stats: {"downloaded": int, "snips": int, "skipped": bool, "stale": bool,
-            "needs_full": bool, "scan_failed": bool, "title": str | None, "finished": bool}
+    stats: {"downloaded": int, "snips": int, "skipped": bool, "stale": bool, "empty": bool,
+            "cleared": int, "needs_full": bool, "scan_failed": bool, "title": str | None,
+            "finished": bool}
       downloaded: new tracks kept. snips: GO+ previews downloaded then discarded
         (not counted in downloaded; they're tracks that couldn't be downloaded).
       skipped=True means scdl was not run (nothing new, or one of the flags below).
-      stale=True means the link is dead (404 / 0 tracks) and needs replacing.
+      stale=True means the link is dead (404, or scdl found none of the archived
+        tracks) and needs replacing.
+      empty=True means the playlist has no tracks on SoundCloud. A warning, not a
+        failure (success is True). cleared: archived tracks dropped because of it.
       needs_full=True (unattended only): the quick check didn't recognise the playlist;
         a full sync could mark tracks [unsync], so it's left for a manual run.
       scan_failed=True (unattended only): the quick check errored; retried next run.
@@ -400,6 +425,8 @@ def run_scdl(
 
     if strategy == _STALE:
         return False, False, False, [], _no_run(stale=True)
+    if strategy == _EMPTY:
+        return True, False, False, [], _no_run(empty=True, cleared=_clear_archive(url))
     if strategy == _SKIP:
         return True, False, False, [], _no_run()
     if strategy in (_MISMATCH, _SCAN_FAILED):
@@ -423,6 +450,9 @@ def run_scdl(
     proc = subprocess.Popen(
         cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
         text=True, encoding="utf-8", errors="replace", cwd=_ROOT,
+        # Otherwise scdl writes to the pipe in the Windows code page (cp1252), so Cyrillic,
+        # symbols and curly quotes in track names arrive garbled when decoded as UTF-8 here.
+        env={**os.environ, "PYTHONIOENCODING": "utf-8:backslashreplace"},
     )
 
     has_error = False
@@ -480,7 +510,7 @@ def run_scdl(
     success = proc.returncode == 0 and not has_error
     return success, aborted, is_conn_error, error_lines, {
         "downloaded": max(downloaded - snips, 0), "snips": snips, "skipped": False, "stale": stale,
-        "needs_full": False, "scan_failed": False, "title": title,
+        "empty": False, "cleared": 0, "needs_full": False, "scan_failed": False, "title": title,
         "finished": finished and not aborted,
     }
 
@@ -494,11 +524,24 @@ class RunResult:
     downloaded: int = 0
     failed: list[str] = field(default_factory=list)  # playlists that didn't sync
     stale: list[str] = field(default_factory=list)
+    empty: list[str] = field(default_factory=list)  # no tracks on SoundCloud: a warning, still synced
     needs_full: list[str] = field(default_factory=list)
     new_tracks: dict[str, int] = field(default_factory=dict)    # url → tracks downloaded
     # url → tracks that failed in a playlist that otherwise synced (geo-blocked, removed, ...)
     track_errors: dict[str, int] = field(default_factory=dict)
     titles: dict[str, str] = field(default_factory=dict)        # url → SoundCloud playlist title
+    # src/dl-audio.md / dl-video.md (unattended runs only), keyed "audio" / "video"
+    queue: dict[str, download_queue.QueueResult] = field(default_factory=dict)
+    queue_crashed: bool = False
+
+    @property
+    def queue_done(self) -> int:
+        return sum(r.done for r in self.queue.values())
+
+    @property
+    def queue_failed(self) -> set[str]:
+        """Failed queue links (kept locally in .sync-last.json, never sent in an alert)."""
+        return {u for r in self.queue.values() for u in r.failed}
 
 
 def sync_list(
@@ -531,7 +574,12 @@ def sync_list(
             elapsed = time.time() - t0
 
             if stats["stale"] and stats["skipped"]:
-                tqdm.write("  → STALE LINK (404 / 0 tracks) — replace it in sc-playlists-list.md")
+                tqdm.write("  → STALE LINK (404) — replace it in sc-playlists-list.md")
+            elif stats["empty"]:
+                tqdm.write("  → WARNING: playlist is empty on SoundCloud — nothing to download. Sync OK.")
+                if stats["cleared"]:
+                    tqdm.write(f"    {stats['cleared']} old track(s) dropped from its archive (files kept);"
+                               " tracks added later sync as a new playlist.")
             elif stats["needs_full"]:
                 tqdm.write("  → NEEDS MANUAL FULL SYNC (first tracks not in the archive) — skipped")
             elif stats["scan_failed"]:
@@ -557,6 +605,8 @@ def sync_list(
                 result.titles[url] = stats["title"]
             if stats["stale"]:
                 result.stale.append(url)
+            elif stats["empty"]:
+                result.empty.append(url)
             elif stats["needs_full"]:
                 result.needs_full.append(url)
             elif not ok and not (stats["finished"] and error_lines and not is_conn_error):
@@ -612,12 +662,14 @@ def _log_header() -> bool:
     """Print what the scheduled run resolved. Returns True if ffmpeg is missing."""
     scdl = _scdl_exe()
     ffmpeg = shutil.which("ffmpeg")
+    node = shutil.which("node")
     if not Path(scdl).is_absolute():
         scdl = f"not next to python; PATH gives {shutil.which('scdl')}"
     print(f"Scheduled sync started {datetime.now().astimezone():%Y-%m-%d %H:%M:%S}")
     print(f"  python: {sys.executable}")
     print(f"  scdl:   {scdl}")
-    print(f"  ffmpeg: {ffmpeg or 'NOT FOUND on PATH'}\n")
+    print(f"  ffmpeg: {ffmpeg or 'NOT FOUND on PATH'}")
+    print(f"  node:   {node or 'NOT FOUND on PATH (YouTube downloads in dl-*.md may fail)'}\n")
     return ffmpeg is None
 
 
@@ -724,8 +776,9 @@ def _alert_text(
     text only. Never usernames, links, slugs, track names or error messages, since the
     text goes through a third-party server.
 
-    Tracks that failed inside a playlist that otherwise synced (geo-blocked etc.) are
-    listed but still count as a success; "action needed" is for playlists that didn't sync."""
+    Tracks that failed inside a playlist that otherwise synced (geo-blocked etc.) and
+    playlists that are empty on SoundCloud are listed but still count as a success;
+    "action needed" is for playlists that didn't sync."""
     lines: list[str] = []
     n = result.downloaded
     if n:
@@ -737,6 +790,11 @@ def _alert_text(
         k = sum(result.track_errors.values())
         lines.append(f"{k} track{_s(k)} couldn't be downloaded (see logs):")
         lines += _per_playlist(result.track_errors, result, line_of)
+    lines += download_queue.summary_lines(result.queue)
+    if result.queue_crashed:
+        lines.append("Download lists (dl-audio.md / dl-video.md) crashed (see logs)")
+    if result.empty:
+        lines.append(f"Empty playlist: {_lines_label(result.empty, line_of)} - synced OK, nothing to download")
     if result.stale:
         lines.append(f"Stale link: {_lines_label(result.stale, line_of)} - paste a fresh share link")
     if result.needs_full:
@@ -758,31 +816,42 @@ def _alert_text(
     return title, "\n".join(lines), tags
 
 
-def _load_last_failed() -> tuple[set[str], set[str]]:
-    """(failed playlists, playlists with failed tracks) from the last unattended run."""
+def _load_last_run() -> tuple[set[str], set[str], set[str], set[str]]:
+    """(failed playlists, playlists with failed tracks, empty playlists, failed
+    dl-audio.md / dl-video.md links) from the last unattended run."""
     try:
         data = json.loads(LAST_RUN_FILE.read_text(encoding="utf-8"))
-        return set(data.get("failed", [])), set(data.get("track_errors", []))
+        return (set(data.get("failed", [])), set(data.get("track_errors", [])),
+                set(data.get("empty", [])), set(data.get("queue_failed", [])))
     except Exception:
-        return set(), set()
+        return set(), set(), set(), set()
 
 
 def _alert_result(result: RunResult, ran: list[str], ffmpeg_missing: bool) -> None:
     """Send the end-of-run alert when something happened or needs attention.
     A playlist that keeps failing alerts once, not every day: failures only alert
     when the set of failing playlists (among those run) changed since last time.
-    Same for playlists with failed tracks (a geo-blocked track fails every day)."""
-    prev_failed, prev_tracks = _load_last_failed()
+    Same for playlists with failed tracks (a geo-blocked track fails every day).
+    An empty playlist alerts on the run it becomes empty, not while it stays empty.
+    Same for links in dl-audio.md / dl-video.md that keep failing."""
+    prev_failed, prev_tracks, prev_empty, prev_queue = _load_last_run()
     ran_set = set(ran)
-    now_failed, now_tracks = set(result.failed), set(result.track_errors)
-    failures_changed = (prev_failed & ran_set) != now_failed or (prev_tracks & ran_set) != now_tracks
+    now_failed, now_tracks, now_empty = set(result.failed), set(result.track_errors), set(result.empty)
+    # a crash leaves the download lists' state unknown: assume it's what it was
+    now_queue = prev_queue if result.queue_crashed else result.queue_failed
+    failures_changed = ((prev_failed & ran_set) != now_failed or (prev_tracks & ran_set) != now_tracks
+                        or prev_queue != now_queue)
+    newly_empty = bool(now_empty - prev_empty)
     with contextlib.suppress(OSError):
         LAST_RUN_FILE.write_text(json.dumps({
             "failed": sorted((prev_failed - ran_set) | now_failed),
             "track_errors": sorted((prev_tracks - ran_set) | now_tracks),
+            "empty": sorted((prev_empty - ran_set) | now_empty),
+            "queue_failed": sorted(now_queue),
         }), encoding="utf-8")
 
-    if not (result.downloaded or result.stale or result.needs_full or ffmpeg_missing or failures_changed):
+    if not (result.downloaded or result.stale or result.needs_full or ffmpeg_missing
+            or failures_changed or newly_empty or result.queue_done or result.queue_crashed):
         print("[notify] nothing new — no alert.")
         return
 
@@ -790,7 +859,7 @@ def _alert_result(result: RunResult, ran: list[str], ffmpeg_missing: bool) -> No
     line_of = {u: j for j, u in enumerate(_list_urls(), 1)}
     title, body, tags = _alert_text(
         result, line_of,
-        failures_cleared=failures_changed and not now_failed and not now_tracks,
+        failures_cleared=failures_changed and not now_failed and not now_tracks and not now_queue,
         ffmpeg_missing=ffmpeg_missing, ytdlp_hint=hint,
     )
     _notify(title, body, tags)
@@ -857,6 +926,7 @@ def _run(args, ffmpeg_missing: bool = False) -> int:
                 unattended=args.unattended,
             )
             if args.unattended:
+                _run_queues(result)
                 _alert_result(result, remaining, ffmpeg_missing)
             return _finalize(result, unattended=args.unattended)
         print("No interrupted run found — starting fresh.\n")
@@ -891,8 +961,23 @@ def _run(args, ffmpeg_missing: bool = False) -> int:
         track_state=True, unattended=args.unattended,
     )
     if args.unattended:
+        _run_queues(result)
         _alert_result(result, to_run, ffmpeg_missing)
     return _finalize(result, unattended=args.unattended)
+
+
+def _run_queues(result: RunResult) -> None:
+    """Scheduled runs: download the links queued in src/dl-audio.md / dl-video.md
+    (see download_queue.py). A crash here is logged and alerted, never stops the run."""
+    print("\n--- Download lists (dl-audio.md / dl-video.md) ---")
+    try:
+        result.queue = download_queue.run_queues(print)
+    except Exception:
+        traceback.print_exc()
+        result.queue_crashed = True
+        return
+    lines = download_queue.summary_lines(result.queue)
+    print("\n".join(lines) if lines else "Nothing queued.")
 
 
 _FAIL_TAG_RE = re.compile(r"^\[FAIL\]", re.MULTILINE)
@@ -926,12 +1011,20 @@ def _run_youtube_retry(urls: list[str]) -> None:
 
 def _report_stale(stale: list[str]) -> None:
     lines = {u: j for j, u in enumerate(_list_urls(), 1)}
-    print(f"\n{len(stale)} playlist link(s) look STALE (404 or 0 tracks) — secret link reset or")
-    print("playlist made private. Open it on SoundCloud → Share → copy link, and replace the line")
+    print(f"\n{len(stale)} playlist link(s) look STALE (not found) — secret link reset, playlist")
+    print("made private or deleted. Open it on SoundCloud → Share → copy link, and replace the line")
     print("in sc-playlists-list.md (the ?si=... part doesn't matter, the s-<token> does):")
     for u in stale:
         line = f"line {lines[u]:2}" if u in lines else "line ?"
         print(f"  {line}: {_label(u)}\n           {u}")
+
+
+def _report_empty(empty: list[str]) -> None:
+    lines = {u: j for j, u in enumerate(_list_urls(), 1)}
+    print(f"\nWarning: {len(empty)} playlist(s) empty on SoundCloud. Synced OK, nothing to download:")
+    for u in empty:
+        line = f"line {lines[u]:2}" if u in lines else "line ?"
+        print(f"  {line}: {_label(u)}")
 
 
 def _report_needs_full(needs_full: list[str]) -> None:
@@ -949,7 +1042,8 @@ def _report_needs_full(needs_full: list[str]) -> None:
 
 def _finalize(result: RunResult, unattended: bool = False) -> int:
     """Print the end-of-run report. Returns the exit code: 0 success (tracks may have
-    failed inside playlists that otherwise synced), 1 needs attention."""
+    failed inside playlists that otherwise synced, playlists may be empty), 1 needs
+    attention."""
     removed = delete_empty(ARCHIVE_DIR)
     if removed:
         print(f"\nRemoved {len(removed)} empty file(s) from archive_trackers/sc.")
@@ -961,6 +1055,8 @@ def _finalize(result: RunResult, unattended: bool = False) -> int:
         print(f"\n{result.downloaded} new track(s) downloaded.")
         for u, n in result.new_tracks.items():
             print(f"  {name(u)}: {n}")
+    if result.empty:
+        _report_empty(result.empty)
     if result.stale:
         _report_stale(result.stale)
     if result.needs_full:

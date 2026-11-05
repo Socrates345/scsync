@@ -9,8 +9,9 @@ from pathlib import Path
 from typing import ClassVar
 
 import pytest
+import yt_dlp
 
-_SRC = Path(__file__).resolve().parent.parent / "src"
+_SRC =Path(__file__).resolve().parent.parent / "src"
 
 
 def _load():
@@ -132,6 +133,92 @@ def test_up_to_date_playlist_is_skipped(playlist, monkeypatch):
     assert not stats["needs_full"]
 
 
+class _FakeYDL:
+    answer: ClassVar[object] = None
+
+    def __init__(self, _params) -> None:
+        pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_exc) -> None:
+        pass
+
+    def extract_info(self, _url, download=False):
+        assert not download
+        if isinstance(self.answer, Exception):
+            raise self.answer
+        return self.answer
+
+
+@pytest.mark.parametrize(
+    ("answer", "expected"),
+    [
+        ({"title": "Inbox", "entries": []}, []),
+        ({"entries": [{"id": 7}, None, {"id": 8}]}, ["7", "8"]),
+        (Exception("Unable to download JSON metadata: HTTP Error 404: Not Found"), ssp._GONE),
+        (Exception("HTTP Error 500: Internal Server Error"), None),
+        (None, None),
+    ],
+)
+def test_fetch_ids_tells_empty_playlist_from_dead_link(monkeypatch, answer, expected):
+    monkeypatch.setattr(_FakeYDL, "answer", answer)
+    monkeypatch.setattr(yt_dlp, "YoutubeDL", _FakeYDL)
+    assert ssp._fetch_ids_at(URL, "1:3") == expected
+
+
+@pytest.mark.parametrize("force_all", [False, True])
+def test_empty_playlist_is_a_warning_not_a_dead_link(playlist, monkeypatch, force_all):
+    archive = ssp.archive_path(playlist)
+    archive.with_suffix(".failed").write_text("[FAIL] 3 x\n", encoding="utf-8")
+    archive.with_suffix(".premium").write_text("4 y\n", encoding="utf-8")
+    monkeypatch.setattr(ssp, "_fetch_ids_at", _fetch([], []))
+    monkeypatch.setattr(ssp.subprocess, "Popen", _NoPopen)
+    ok, _, _, _, stats = ssp.run_scdl(playlist, 5, force_all, write=_quiet, unattended=True)
+    assert ok
+    assert stats["empty"]
+    assert not stats["stale"]
+    assert stats["cleared"] == 5
+    assert not archive.exists()
+    assert not archive.with_suffix(".failed").exists()
+    assert archive.with_suffix(".premium").exists()  # append-only GO+ log, kept
+
+
+def test_refilled_playlist_syncs_as_new(playlist, monkeypatch, fake_proc):
+    """Tracks added after the playlist was empty are all new: a scheduled run
+    downloads them (first full sync) instead of asking for a manual one."""
+    monkeypatch.setattr(ssp, "_fetch_ids_at", _fetch([], []))
+    ssp.run_scdl(playlist, 5, write=_quiet, unattended=True)
+    monkeypatch.setattr(ssp, "_fetch_ids_at", _fetch(["97", "98"], []))
+    ok, _, _, _, stats = ssp.run_scdl(playlist, 5, write=_quiet, unattended=True)
+    cmd, _ = fake_proc.calls[0]
+    assert "-o" not in cmd
+    assert ok
+    assert not stats["needs_full"]
+
+
+def test_404_is_still_a_stale_link(playlist, monkeypatch):
+    monkeypatch.setattr(ssp, "_fetch_ids_at", _fetch(ssp._GONE, ssp._GONE))
+    monkeypatch.setattr(ssp.subprocess, "Popen", _NoPopen)
+    ok, _, _, _, stats = ssp.run_scdl(playlist, 5, write=_quiet, unattended=True)
+    assert not ok
+    assert stats["stale"]
+    assert not stats["empty"]
+    assert ssp.archive_path(playlist).exists()
+
+
+def test_empty_playlist_counts_as_synced(playlist, monkeypatch, tmp_path):
+    monkeypatch.setattr(ssp, "STATE_FILE", tmp_path / "state.json")
+    monkeypatch.setattr(ssp, "_fetch_ids_at", _fetch([], []))
+    monkeypatch.setattr(ssp.subprocess, "Popen", _NoPopen)
+    result = ssp.sync_list([playlist], 0, 5, force_all=False, unattended=True)
+    assert result.empty == [playlist]
+    assert result.stale == []
+    assert result.failed == []
+    assert ssp._finalize(result, unattended=True) == 0
+
+
 def test_unattended_stops_after_repeated_scan_errors(tmp_path, monkeypatch):
     urls = [f"https://soundcloud.com/someone/sets/mix-{i}" for i in range(4)]
     monkeypatch.setattr(ssp, "ARCHIVE_DIR", tmp_path)
@@ -179,6 +266,7 @@ def test_alert_text_has_no_identifiers():
         downloaded=5,
         failed=_SECRET_URLS[0:3],
         stale=[_SECRET_URLS[4]],
+        empty=[_SECRET_URLS[5]],
         needs_full=[_SECRET_URLS[6]],
     )
     title, body, tags = ssp._alert_text(result, line_of, ffmpeg_missing=True, ytdlp_hint="yt-dlp is old")
@@ -188,6 +276,7 @@ def test_alert_text_has_no_identifiers():
     assert "5 new tracks" in body
     assert "Failed: lines 1-3" in body
     assert "Stale link: line 5" in body
+    assert "Empty playlist: line 6" in body
     assert "--force-all --only 7" in body
     assert "yt-dlp is old" in body
     assert tags == "warning"
@@ -225,6 +314,41 @@ def test_alert_track_errors_are_still_a_success():
         ssp.RunResult(track_errors={u[0]: 1}, titles={u[0]: "Metal"}), line_of)
     assert (title, tags) == ("SC sync: success", "white_check_mark")
     assert body == "No new tracks\n1 track couldn't be downloaded (see logs):\n- Metal: 1"
+
+
+_EMPTY_LINE = "Empty playlist: line 3 - synced OK, nothing to download"
+
+
+def test_alert_empty_playlist_is_a_success():
+    line_of = {u: i for i, u in enumerate(_SECRET_URLS, 1)}
+    title, body, tags = ssp._alert_text(ssp.RunResult(empty=[_SECRET_URLS[2]]), line_of)
+    assert (title, tags) == ("SC sync: success", "white_check_mark")
+    assert body == f"No new tracks\n{_EMPTY_LINE}"
+
+
+def test_empty_playlist_alerts_once(tmp_path, monkeypatch):
+    monkeypatch.setattr(ssp, "ytdlp_update_hint", lambda: None)
+    monkeypatch.setattr(ssp, "LAST_RUN_FILE", tmp_path / "last.json")
+    plist = tmp_path / "list.md"
+    plist.write_text("\n".join(_SECRET_URLS), encoding="utf-8")
+    monkeypatch.setattr(ssp, "PLAYLIST_FILE", plist)
+    sent: list[tuple[str, str]] = []
+
+    def notify(title, body, _tags=""):
+        sent.append((title, body))
+        return True
+
+    monkeypatch.setattr(ssp, "_notify", notify)
+    u = _SECRET_URLS[2]
+    ran = [u]
+    ssp._alert_result(ssp.RunResult(empty=[u]), ran, ffmpeg_missing=False)
+    ssp._alert_result(ssp.RunResult(empty=[u]), ran, ffmpeg_missing=False)
+    assert sent == [("SC sync: success", f"No new tracks\n{_EMPTY_LINE}")]
+    # refilled, then emptied again: warned again
+    ssp._alert_result(ssp.RunResult(downloaded=2, new_tracks={u: 2}), ran, ffmpeg_missing=False)
+    ssp._alert_result(ssp.RunResult(empty=[u]), ran, ffmpeg_missing=False)
+    assert len(sent) == 3
+    assert sent[-1] == ("SC sync: success", f"No new tracks\n{_EMPTY_LINE}")
 
 
 def _scripted_proc(lines: list[str], returncode: int):
@@ -421,3 +545,89 @@ def test_notify_posts_without_printing_topic(monkeypatch, capsys):
     assert req.get_header("Title") == "SC sync"
     assert req.get_header("Tags") == "musical_note"
     assert "very-secret-topic" not in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------------------
+# Download lists (src/dl-audio.md / dl-video.md)
+# ---------------------------------------------------------------------------
+
+_YT = "https://www.youtube.com/watch?v=zq9secretvid"
+
+
+def _queue(**kinds):
+    return {k: ssp.download_queue.QueueResult(**v) for k, v in kinds.items()}
+
+
+def test_alert_text_download_lists():
+    result = ssp.RunResult(downloaded=1, queue=_queue(audio={"done": 2}, video={"done": 1, "failed": [_YT]}))
+    title, body, tags = ssp._alert_text(result, {})
+    assert (title, tags) == ("SC sync: success", "musical_note")
+    assert body == (
+        "1 new track\n"
+        "Audio list: 2 downloaded\n"
+        "Video list: 1 downloaded\n"
+        "Video list: 1 link failed, kept for next run (see logs)"
+    )
+    assert "zq9secretvid" not in body
+    assert "http" not in body
+    _, body, _ = ssp._alert_text(ssp.RunResult(queue_crashed=True), {})
+    assert body == "No new tracks\nDownload lists (dl-audio.md / dl-video.md) crashed (see logs)"
+
+
+@pytest.fixture
+def alerts(tmp_path, monkeypatch, playlist):
+    monkeypatch.setattr(ssp, "ytdlp_update_hint", lambda: None)
+    monkeypatch.setattr(ssp, "LAST_RUN_FILE", tmp_path / "last.json")
+    sent: list[str] = []
+
+    def notify(_title, body, _tags=""):
+        sent.append(body)
+        return True
+
+    monkeypatch.setattr(ssp, "_notify", notify)
+    return sent, [playlist]
+
+
+def test_download_list_download_alerts(alerts):
+    sent, ran = alerts
+    ssp._alert_result(ssp.RunResult(queue=_queue(audio={"done": 1})), ran, ffmpeg_missing=False)
+    ssp._alert_result(ssp.RunResult(queue=_queue(audio={"done": 1})), ran, ffmpeg_missing=False)
+    assert sent == ["No new tracks\nAudio list: 1 downloaded"] * 2
+    ssp._alert_result(ssp.RunResult(queue=_queue(audio={})), ran, ffmpeg_missing=False)
+    assert len(sent) == 2  # nothing queued: silent
+
+
+def test_download_list_failure_alerts_once(alerts):
+    sent, ran = alerts
+    failing = ssp.RunResult(queue=_queue(video={"failed": [_YT]}))
+    ssp._alert_result(failing, ran, ffmpeg_missing=False)
+    ssp._alert_result(failing, ran, ffmpeg_missing=False)
+    assert sent == ["No new tracks\nVideo list: 1 link failed, kept for next run (see logs)"]
+    # a crash says so, but doesn't forget the failing link
+    ssp._alert_result(ssp.RunResult(queue_crashed=True), ran, ffmpeg_missing=False)
+    ssp._alert_result(failing, ran, ffmpeg_missing=False)
+    assert len(sent) == 2
+    assert "crashed" in sent[1]
+    assert "cleared" not in sent[1]
+    # fixed (downloaded, or removed by hand)
+    ssp._alert_result(ssp.RunResult(queue=_queue(video={})), ran, ffmpeg_missing=False)
+    assert sent[-1] == "No new tracks\nEarlier failures cleared"
+
+
+def test_run_queues_crash_is_contained(monkeypatch, capsys):
+    def boom(_write):
+        raise OSError("disk")
+
+    monkeypatch.setattr(ssp.download_queue, "run_queues", boom)
+    result = ssp.RunResult()
+    ssp._run_queues(result)
+    assert result.queue_crashed
+    assert "OSError" in capsys.readouterr().err
+
+
+def test_run_queues_records_results(monkeypatch):
+    monkeypatch.setattr(ssp.download_queue, "run_queues", lambda _write: _queue(audio={"done": 3}))
+    result = ssp.RunResult()
+    ssp._run_queues(result)
+    assert result.queue_done == 3
+    assert not result.queue_crashed

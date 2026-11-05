@@ -4,7 +4,8 @@
 Registers (or updates) the "scdl daily sync" scheduled task.
 
 .DESCRIPTION
-Runs "src\sync_sc_playlists.py --unattended" every day at 18:00 (local time),
+Runs "src\sync_sc_playlists.py --unattended" every day at 18:00 (local time):
+the SoundCloud playlists, then the links queued in src\dl-audio.md / dl-video.md,
 hidden, as you, even when you are logged out (S4U: no password is stored).
 If the laptop is asleep or off at 18:00, the run starts as soon as it is back.
 Run it again at any time to update the task.
@@ -44,7 +45,7 @@ $principal = New-ScheduledTaskPrincipal -UserId $User -LogonType S4U -RunLevel L
 
 Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Settings $settings `
     -Principal $principal -Force `
-    -Description 'Daily SoundCloud playlist sync (sync_sc_playlists.py --unattended). Logs in the repo logs folder.' | Out-Null
+    -Description 'Daily SoundCloud playlist sync, then the links in src\dl-audio.md / dl-video.md (sync_sc_playlists.py --unattended). Logs in the repo logs folder.' | Out-Null
 
 Write-Host "Registered '$TaskName' for $User - daily at $At, hidden, catches up if missed."
 Write-Host ""
