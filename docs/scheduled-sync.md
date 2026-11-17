@@ -36,7 +36,7 @@ Unregister-ScheduledTask -TaskName 'scdl daily sync' -Confirm:$false  # remove
 
 - **Output goes to a log file**: `logs/sc-sync_<date>_<time>.log`, newest 30 kept, starting with the python, scdl and ffmpeg paths it used. No progress bar.
 - **No full sync of a playlist you already have.** If the quick check doesn't recognize a playlist (reshuffled, or the link now points elsewhere), it's reported as "needs a manual full sync" with the `--force-all --only <lines>` command, because a full sync can rename tracks `[unsync]` and you should see that happen. If the check itself errors, the playlist counts as failed and is tried again next run. Three of those in a row stop the run (offline or blocked). New playlists still get their first full download.
-- **No YouTube retry.** Failed tracks wait for a manual run, or `python src/retry_failed_with_ytdl.py --all`.
+- **YouTube retry before the alert.** `[FAIL]` tracks (DRM-protected, GO+ previews) of the playlists that synced are looked up on YouTube right away, and the alert counts them separately (`2 tracks downloaded from YouTube instead ([YT] files)`). It takes the top search match, so give a new `[YT]` file a listen. Playlists that failed to sync wait for a manual run, or `python src/retry_failed_with_ytdl.py --all`.
 - **The computer stays awake** while it runs.
 
 Removed tracks are only ever detected by a `--force-all` you run yourself. Files you added to a playlist folder are never touched (a playlist rename moves the whole folder, those included).
@@ -61,7 +61,7 @@ Subscribe to that topic in the ntfy app, then check it works:
 python src/sync_sc_playlists.py --notify-test
 ```
 
-An alert is sent when there are new tracks, a dead link, a playlist that needs a manual full sync, ffmpeg is missing, the run crashed, or the set of failing playlists (or of playlists with failed tracks) changed since the last scheduled run (kept in `.sync-last.json`). A track that keeps failing alerts once, not every day. Nothing changed, no alert.
+An alert is sent when there are new tracks, a link that just went dead, a playlist that needs a manual full sync, ffmpeg is missing, the run crashed, or the set of failing playlists (or of playlists with failed tracks) changed since the last scheduled run (kept in `.sync-last.json`). A track that keeps failing or a link that stays dead alerts once, not every day. Nothing changed, no alert.
 
 A typical alert:
 
@@ -74,7 +74,7 @@ SC sync: success
 - Workout: 2
 ```
 
-Tracks that fail inside a playlist that otherwise synced (geo-blocked, removed, ...) still count as a success. The title only says `SC sync: action needed` when a playlist itself needs you: a dead link, a manual full sync, a playlist that couldn't be synced, or missing ffmpeg.
+Tracks that fail inside a playlist that otherwise synced (geo-blocked, removed, ...) still count as a success. So does a dead link: it shows as a warning line (`Warning: stale link on line N - paste a fresh share link`) and stays listed in later alerts until you replace it. The title only says `SC sync: action needed` when a playlist itself needs you: a manual full sync, a playlist that couldn't be synced, or missing ffmpeg.
 
 Alerts pass through ntfy's server, so they only hold counts, line numbers, playlist titles and fixed wording. Never usernames, links, track names or error messages.
 

@@ -59,12 +59,12 @@ python src/sync_sc_playlists.py --force-all --only 12
 
 At the end of a run it:
 
-- tries YouTube for tracks that failed (manual runs only, see [GO+ and failed tracks](#go-and-failed-tracks))
+- tries YouTube for tracks that failed (scheduled runs do it too, before the alert; see [GO+ and failed tracks](#go-and-failed-tracks))
 - lists dead links by line number: open the playlist on SoundCloud, **Share**, copy the link and replace that line. The `?si=...` part doesn't matter, the `s-<token>` part does.
 - lists playlists the quick check didn't recognize, with the `--force-all --only ...` command to run
 - deletes empty files in `archive_trackers/sc` (also `python src/cleanup_empty_archives.py`)
 
-Exit codes: `0` success (some tracks may have failed, e.g. geo-blocked), `1` something needs your attention (a playlist failed, dead link, needs a full sync), `75` another sync is already running.
+Exit codes: `0` success (some tracks may have failed, e.g. geo-blocked, or a link may be dead), `1` something needs your attention (a playlist failed, needs a full sync), `75` another sync is already running.
 
 ### One playlist, track or user
 
@@ -214,7 +214,7 @@ python src/retry_failed_with_ytdl.py <playlist> # one playlist (name, part of it
 python src/retry_failed_with_ytdl.py --all --dry-run
 ```
 
-A track found on YouTube is saved in the playlist's folder as `[YT] <artist> - <title>`, added to the archive (so the sync stops retrying it) and removed from `.failed`. A manual `sync_sc_playlists.py` run does this by itself at the end for playlists with failures. `--delay S` sets the pause between tracks (default 3s).
+A track found on YouTube is saved in the playlist's folder as `[YT] <artist> - <title>`, added to the archive (so the sync stops retrying it) and removed from `.failed`. A manual `sync_sc_playlists.py` run does this by itself at the end for playlists with failures, and a scheduled run (`--unattended`) before its alert for the playlists that synced. `--delay S` sets the pause between tracks (default 3s).
 
 Each playlist in `archive_trackers/sc/` has:
 
@@ -306,7 +306,7 @@ YouTube archives are named after the playlist id, with the playlist title added 
 
 | You see | Do |
 | --- | --- |
-| "STALE" / "Stale link: line N" | The secret link was reset or the playlist made private. Paste a fresh share link on that line. The old archive is picked up automatically. |
+| "STALE" / "Warning: stale link on line N" | The secret link was reset or the playlist made private. Paste a fresh share link on that line. The old archive is picked up automatically. |
 | "not recognised by the quick check" | The playlist was reshuffled or the link points at another playlist. Run the `--force-all --only N` command it prints and check what gets `[unsync]`. |
 | Exit code 75 | Another sync is running (the scheduled one?). Wait for it. |
 | "Rate limit — cooling down" | SoundCloud is pushing back. Raise `--delay`, or try later. |

@@ -765,6 +765,7 @@ def download_url(url: str, **scdl_args: Unpack[SCDLArgs]) -> None:
                             entry["uploader"] = parts[0]
                         if not entry["title"] and len(parts) >= 2:
                             entry["title"] = parts[1].replace("-", " ")
+                            entry["title_from_slug"] = True  # a guess: the real title is looked up below
 
                 def info(self, msg, *args, **kwargs): _base_logger.info(msg, *args, **kwargs)
                 def warning(self, msg, *args, **kwargs): _base_logger.warning(msg, *args, **kwargs)
@@ -872,14 +873,15 @@ def download_url(url: str, **scdl_args: Unpack[SCDLArgs]) -> None:
                         track_url = info["url"]
                         track_id = archive_id.split()[-1]
                         track_json: dict | None = None
-                        if not info["title"]:
+                        if not info["title"] or info.get("title_from_slug"):
                             # Public playlists list most tracks by id only, so one that fails before
-                            # its metadata is read (DRM) has no name yet. Look it up, so the YouTube
-                            # retry searches "uploader - title" instead of the id.
+                            # its metadata is read (DRM) has no name yet, or only the one guessed from
+                            # its URL slug ("zvezda" for "Звезда"). Look it up, so the
+                            # YouTube retry searches the real "uploader - title".
                             track_json = _sc_track_json(track_id)
                             if track_json.get("title"):
                                 info["title"] = track_json["title"]
-                                info["uploader"] = (track_json.get("user") or {}).get("username") or ""
+                                info["uploader"] = (track_json.get("user") or {}).get("username") or info["uploader"]
                         name = " - ".join(filter(None, [info["uploader"], info["title"]])) or archive_id
                         error = _fl_errors.get(archive_id, "")
 

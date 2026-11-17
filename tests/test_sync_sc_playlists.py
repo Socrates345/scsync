@@ -275,7 +275,7 @@ def test_alert_text_has_no_identifiers():
         assert leak not in body
     assert "5 new tracks" in body
     assert "Failed: lines 1-3" in body
-    assert "Stale link: line 5" in body
+    assert "Warning: stale link on line 5" in body
     assert "Empty playlist: line 6" in body
     assert "--force-all --only 7" in body
     assert "yt-dlp is old" in body
@@ -349,6 +349,55 @@ def test_empty_playlist_alerts_once(tmp_path, monkeypatch):
     ssp._alert_result(ssp.RunResult(empty=[u]), ran, ffmpeg_missing=False)
     assert len(sent) == 3
     assert sent[-1] == ("SC sync: success", f"No new tracks\n{_EMPTY_LINE}")
+
+
+_STALE_LINE = "Warning: stale link on line 3 - paste a fresh share link"
+
+
+def test_alert_stale_link_is_a_warning_not_action_needed():
+    line_of = {u: i for i, u in enumerate(_SECRET_URLS, 1)}
+    title, body, tags = ssp._alert_text(ssp.RunResult(stale=[_SECRET_URLS[2]]), line_of)
+    assert (title, tags) == ("SC sync: success", "white_check_mark")
+    assert body == f"No new tracks\n{_STALE_LINE}"
+
+
+def test_stale_link_alerts_once(tmp_path, monkeypatch):
+    monkeypatch.setattr(ssp, "ytdlp_update_hint", lambda: None)
+    last = tmp_path / "last.json"
+    last.write_text('{"failed": [], "empty": []}', encoding="utf-8")  # file from before "stale" existed
+    monkeypatch.setattr(ssp, "LAST_RUN_FILE", last)
+    plist = tmp_path / "list.md"
+    plist.write_text("\n".join(_SECRET_URLS), encoding="utf-8")
+    monkeypatch.setattr(ssp, "PLAYLIST_FILE", plist)
+    sent: list[tuple[str, str]] = []
+
+    def notify(title, body, _tags=""):
+        sent.append((title, body))
+        return True
+
+    monkeypatch.setattr(ssp, "_notify", notify)
+    u, other = _SECRET_URLS[2], _SECRET_URLS[0]
+    ran = [other, u]
+    ssp._alert_result(ssp.RunResult(stale=[u]), ran, ffmpeg_missing=False)
+    ssp._alert_result(ssp.RunResult(stale=[u]), ran, ffmpeg_missing=False)
+    assert sent == [("SC sync: success", f"No new tracks\n{_STALE_LINE}")]
+    # still stale: listed in an alert sent for something else
+    ssp._alert_result(ssp.RunResult(stale=[u], downloaded=1, new_tracks={other: 1}), ran, ffmpeg_missing=False)
+    assert sent[-1] == ("SC sync: success", f"1 new track:\n- line 1: 1\n{_STALE_LINE}")
+    # a run that skipped it doesn't forget it
+    ssp._alert_result(ssp.RunResult(), [other], ffmpeg_missing=False)
+    ssp._alert_result(ssp.RunResult(stale=[u]), ran, ffmpeg_missing=False)
+    assert len(sent) == 2
+    # fixed, then dead again: warned again
+    ssp._alert_result(ssp.RunResult(), ran, ffmpeg_missing=False)
+    ssp._alert_result(ssp.RunResult(stale=[u]), ran, ffmpeg_missing=False)
+    assert len(sent) == 3
+
+
+def test_finalize_stale_link_exits_0(playlist, tmp_path, monkeypatch):
+    monkeypatch.setattr(ssp, "STATE_FILE", tmp_path / "state.json")
+    assert ssp._finalize(ssp.RunResult(stale=[playlist]), unattended=True) == 0
+    assert ssp._finalize(ssp.RunResult(stale=[playlist], needs_full=[playlist]), unattended=True) == 1
 
 
 def _scripted_proc(lines: list[str], returncode: int):
@@ -631,3 +680,124 @@ def test_run_queues_records_results(monkeypatch):
     ssp._run_queues(result)
     assert result.queue_done == 3
     assert not result.queue_crashed
+
+
+def test_sync_module_does_not_import_ytdlp_at_load():
+    """Scheduled runs upgrade yt-dlp before using it, so loading the module must not import it."""
+    assert "ytdlp_age" not in vars(ssp)
+
+
+def test_upgrade_ytdlp_without_uv_is_logged(monkeypatch, capsys):
+    monkeypatch.setattr(ssp.shutil, "which", lambda *_a, **_k: None)
+    monkeypatch.setattr(ssp, "_ytdlp_installed", lambda: "2026.01.01")
+    ssp._upgrade_ytdlp()
+    assert "not upgraded, uv not found" in capsys.readouterr().out
+
+
+def test_upgrade_ytdlp_runs_uv_and_logs_new_version(monkeypatch, capsys):
+    versions = iter(["2026.01.01", "2026.11.01"])
+    calls: list[list[str]] = []
+
+    def run(cmd, **kwargs):
+        calls.append(cmd)
+        assert kwargs["cwd"] == ssp._ROOT
+        return ssp.subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setattr(ssp.shutil, "which", lambda *_a, **_k: "uv")
+    monkeypatch.setattr(ssp, "_ytdlp_installed", lambda: next(versions))
+    monkeypatch.setattr(ssp.subprocess, "run", run)
+    ssp._upgrade_ytdlp()
+    assert calls == [["uv", "sync", "--upgrade-package", "yt-dlp"]]
+    assert "upgraded 2026.01.01 -> 2026.11.01" in capsys.readouterr().out
+
+
+def test_upgrade_ytdlp_failure_does_not_raise(monkeypatch, capsys):
+    monkeypatch.setattr(ssp.shutil, "which", lambda *_a, **_k: "uv")
+    monkeypatch.setattr(ssp, "_ytdlp_installed", lambda: "2026.01.01")
+    monkeypatch.setattr(ssp.subprocess, "run",
+                        lambda cmd, **_k: ssp.subprocess.CompletedProcess(cmd, 2, "", "network error"))
+    ssp._upgrade_ytdlp()
+    out = capsys.readouterr().out
+    assert "exited 2" in out
+    assert "network error" in out
+
+
+# ---------------------------------------------------------------------------
+# YouTube retry of failed tracks (unattended runs)
+# ---------------------------------------------------------------------------
+
+def _failed_block(tag: str, n: int) -> str:
+    return (f"{tag} someone - song {n}\n         https://soundcloud.com/someone/song-{n}\n"
+            f"       → ERROR: [soundcloud] {100 + n}: This video is DRM protected\n\n")
+
+
+def _fake_retry(failed_path: Path, keep: str, calls: list):
+    """Fake retry_failed_with_ytdl.py run: leaves `keep` as the .failed content ('' deletes it)."""
+
+    class Proc:
+        def __init__(self, cmd, **_kwargs) -> None:
+            calls.append(cmd)
+            if keep:
+                failed_path.write_text(keep, encoding="utf-8")
+            else:
+                failed_path.unlink()
+            self.stdout = iter(["[1/2] someone - song 1 — searching YouTube\n",
+                                "Recovered 1/2 track(s) via YouTube.\n"])
+            self.returncode = 0
+
+        def wait(self) -> int:
+            return 0
+
+    return Proc
+
+
+def test_unattended_failed_tracks_are_tried_on_youtube(playlist, monkeypatch):
+    failed = ssp.archive_path(playlist).with_suffix(".failed")
+    monetize = _failed_block("[MONETIZE]", 3)
+    failed.write_text(_failed_block("[FAIL]    ", 1) + _failed_block("[FAIL]    ", 2) + monetize, encoding="utf-8")
+    calls: list = []
+    monkeypatch.setattr(ssp.subprocess, "Popen", _fake_retry(failed, _failed_block("[FAIL]    ", 2) + monetize, calls))
+    result = ssp.RunResult(track_errors={playlist: 3}, titles={playlist: "Metal"})
+    ssp._recover_via_youtube(result, write=_quiet)
+    assert calls[0][-1] == ssp.archive_path(playlist).stem
+    assert result.yt_recovered == {playlist: 1}
+    assert result.track_errors == {playlist: 2}  # one [FAIL] YouTube didn't find + the [MONETIZE] one
+
+    # all recovered: the playlist no longer has failed tracks
+    failed.write_text(_failed_block("[FAIL]    ", 1) + _failed_block("[FAIL]    ", 2), encoding="utf-8")
+    monkeypatch.setattr(ssp.subprocess, "Popen", _fake_retry(failed, "", calls))
+    result = ssp.RunResult(track_errors={playlist: 2})
+    ssp._recover_via_youtube(result, write=_quiet)
+    assert result.yt_recovered == {playlist: 2}
+    assert result.track_errors == {}
+
+
+def test_youtube_retry_skips_playlists_that_did_not_sync(playlist, monkeypatch):
+    failed = ssp.archive_path(playlist).with_suffix(".failed")
+    failed.write_text(_failed_block("[FAIL]    ", 1), encoding="utf-8")
+    calls: list = []
+    monkeypatch.setattr(ssp.subprocess, "Popen", _fake_retry(failed, "", calls))
+    ssp._recover_via_youtube(ssp.RunResult(failed=[playlist]), write=_quiet)
+    # only [GO+] / [MONETIZE] entries: nothing retry_failed_with_ytdl.py would act on
+    failed.write_text(_failed_block("[GO+]     ", 1), encoding="utf-8")
+    ssp._recover_via_youtube(ssp.RunResult(track_errors={playlist: 1}), write=_quiet)
+    assert calls == []
+
+
+def test_youtube_retry_crash_is_contained(monkeypatch, capsys):
+    def boom(_result, _write=print):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(ssp, "_recover_via_youtube", boom)
+    ssp._run_youtube_recovery(ssp.RunResult())
+    assert "RuntimeError" in capsys.readouterr().err
+
+
+def test_alert_youtube_recovered_tracks(alerts):
+    sent, ran = alerts
+    result = ssp.RunResult(yt_recovered={ran[0]: 2}, titles={ran[0]: "Metal"})
+    title, body, tags = ssp._alert_text(result, {ran[0]: 1})
+    assert (title, tags) == ("SC sync: success", "musical_note")
+    assert body == "No new tracks\n2 tracks downloaded from YouTube instead ([YT] files):\n- Metal: 2"
+    ssp._alert_result(result, ran, ffmpeg_missing=False)
+    assert sent == [body]

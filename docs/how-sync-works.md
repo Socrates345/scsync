@@ -100,5 +100,5 @@ This only happens on a full sync: with `--force-all`, or a manual run that falls
 - **Error filter.** scdl's output is filtered to new downloads, errors and warnings. After `--max-errors` errors in a row the playlist is dropped and the run cools down 2 minutes. Any normal `[soundcloud]` line resets the count, so scattered errors don't trigger it.
 - **Pauses.** `--delay` seconds between playlists (default 8), randomized ±50%.
 - **Clean-up.** At the end, every empty file in `archive_trackers/sc` is deleted. A clean run leaves an empty `.failed` behind, and an empty `.txt` means the same as no archive.
-- **YouTube retry.** A manual run then runs `retry_failed_with_ytdl.py` on the failed playlists that have `[FAIL]` tracks.
+- **YouTube retry.** A manual run then runs `retry_failed_with_ytdl.py` on the failed playlists that have `[FAIL]` tracks. A scheduled run does it before its alert, only for the playlists that synced. When scdl only knows a failed track by its URL slug (`zvezda`), it looks up the real title for `.failed`, so YouTube is searched for `Звезда` instead.
 - **scdl lookup.** The script runs the `scdl` next to its own Python, so the venv doesn't need to be active, from the repo folder (scdl puts archives under `<current folder>/archive_trackers/sc`).

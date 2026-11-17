@@ -1,6 +1,10 @@
 version = 1
 revision = 1
 requires-python = ">=3.10.0"
+resolution-markers = [
+    "python_full_version >= '3.11'",
+    "python_full_version < '3.11'",
+]
 
 [[package]]
 name = "certifi"
@@ -216,7 +220,7 @@ name = "exceptiongroup"
 version = "1.3.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "typing-extensions", marker = "python_full_version < '3.13'" },
+    { name = "typing-extensions", marker = "python_full_version < '3.11'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/0b/9f/a65090624ecf468cdca03533906e7c69ed7588582240cfe7cc9e770b50eb/exceptiongroup-1.3.0.tar.gz", hash = "sha256:b241f5885f560bc56a59ee63ca4c6a8bfa46ae4ad651af316d4e81817bb9fd88", size = 29749 }
 wheels = [
@@ -398,7 +402,8 @@ dependencies = [
     { name = "mutagen" },
     { name = "soundcloud-v2" },
     { name = "tqdm" },
-    { name = "yt-dlp", extra = ["curl-cffi"] },
+    { name = "yt-dlp", version = "2026.10.21", source = { registry = "https://pypi.org/simple" }, extra = ["curl-cffi"], marker = "python_full_version < '3.11'" },
+    { name = "yt-dlp", version = "2026.10.26", source = { registry = "https://pypi.org/simple" }, extra = ["curl-cffi"], marker = "python_full_version >= '3.11'" },
 ]
 
 [package.dev-dependencies]
@@ -536,6 +541,9 @@ wheels = [
 name = "yt-dlp"
 version = "2026.10.21"
 source = { registry = "https://pypi.org/simple" }
+resolution-markers = [
+    "python_full_version < '3.11'",
+]
 sdist = { url = "https://files.pythonhosted.org/packages/06/13/d2ea252871826205dc4965cb70e6037ab93697fcabf4feda49fe981f6da0/yt_dlp-2026.10.21.tar.gz", hash = "sha256:cbf748d7d17cd37647c4b9f07b6c25f24384bfd4361407ee5ec519e753d22539", size = 3057326 }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/b7/75/ae700ddc7e0b1095fd06cf7e251627dcf4cafcaff460cce92cdc08023b13/yt_dlp-2026.10.21-py3-none-any.whl", hash = "sha256:94a3a3e2c423129d0bbd2f1be000c4171fa1226c29e251c84aff868f2851c247", size = 3188012 },
@@ -543,6 +551,23 @@ wheels = [
 
 [package.optional-dependencies]
 curl-cffi = [
-    { name = "curl-cffi", marker = "implementation_name == 'cpython'" },
+    { name = "curl-cffi", marker = "python_full_version < '3.11' and implementation_name == 'cpython'" },
     { name = "typing-extensions", marker = "python_full_version < '3.11'" },
+]
+
+[[package]]
+name = "yt-dlp"
+version = "2026.10.26"
+source = { registry = "https://pypi.org/simple" }
+resolution-markers = [
+    "python_full_version >= '3.11'",
+]
+sdist = { url = "https://files.pythonhosted.org/packages/83/31/4be3987022a6244550ab6a3afe45ad10ac10b5e5ab8874bd8eecc7f8b937/yt_dlp-2026.10.26.tar.gz", hash = "sha256:abe5c6b94c3b2f0560500add1c42e0a97641752743a5b65588ac2007a6e23eb6", size = 3048880 }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/7f/3d/16ea7d5638cf585991f2c5705e8083688dde633d32d0871f2404e0f4d827/yt_dlp-2026.10.26-py3-none-any.whl", hash = "sha256:a05c5b5d8562f7e8a62f5334348b406af4930d56d3a65f8021d14af0e22339ae", size = 3186201 },
+]
+
+[package.optional-dependencies]
+curl-cffi = [
+    { name = "curl-cffi", marker = "python_full_version >= '3.11' and implementation_name == 'cpython'" },
 ]

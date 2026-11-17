@@ -21,7 +21,9 @@ from tqdm import tqdm
 
 import download_queue
 from cleanup_empty_archives import delete_empty
-from ytdlp_age import ytdlp_update_hint
+
+# Nothing in this module may import yt_dlp at load time: scheduled runs upgrade it
+# first (_upgrade_ytdlp), and the in-process fast path should get the new version.
 
 _ROOT = Path(__file__).parent.parent
 PLAYLIST_FILE = Path(__file__).parent / "sc-playlists-list.md"
@@ -529,6 +531,8 @@ class RunResult:
     new_tracks: dict[str, int] = field(default_factory=dict)    # url → tracks downloaded
     # url → tracks that failed in a playlist that otherwise synced (geo-blocked, removed, ...)
     track_errors: dict[str, int] = field(default_factory=dict)
+    # url → failed tracks downloaded from YouTube instead (unattended runs, _recover_via_youtube)
+    yt_recovered: dict[str, int] = field(default_factory=dict)
     titles: dict[str, str] = field(default_factory=dict)        # url → SoundCloud playlist title
     # src/dl-audio.md / dl-video.md (unattended runs only), keyed "audio" / "video"
     queue: dict[str, download_queue.QueueResult] = field(default_factory=dict)
@@ -673,6 +677,49 @@ def _log_header() -> bool:
     return ffmpeg is None
 
 
+def _ytdlp_installed() -> str:
+    """Installed yt-dlp version, read from its metadata (doesn't import it)."""
+    from importlib.metadata import PackageNotFoundError, version
+    try:
+        return version("yt-dlp")
+    except PackageNotFoundError:
+        return "not installed"
+
+
+def _upgrade_ytdlp() -> None:
+    """Scheduled runs: `uv sync --upgrade-package yt-dlp` before anything imports yt_dlp.
+
+    Runs while holding .sync.lock, so no other sync is using the venv. A failure
+    (uv missing, offline) is logged and the sync goes on with the installed version.
+    """
+    home = Path.home()
+    search = os.pathsep.join([os.environ.get("PATH", ""), str(home / ".local" / "bin"), str(home / ".cargo" / "bin")])
+    uv = shutil.which("uv", path=search)
+    before = _ytdlp_installed()
+    if uv is None:
+        print(f"yt-dlp: {before} - not upgraded, uv not found on PATH or in ~/.local/bin\n")
+        return
+    try:
+        proc = subprocess.run(
+            [uv, "sync", "--upgrade-package", "yt-dlp"],
+            cwd=_ROOT, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=600,
+        )
+    except (OSError, subprocess.SubprocessError) as e:
+        print(f"yt-dlp: {before} - upgrade failed ({type(e).__name__}), syncing with it anyway\n")
+        return
+    if proc.returncode != 0:
+        print(f"yt-dlp: {before} - `uv sync --upgrade-package yt-dlp` exited {proc.returncode}, syncing with it anyway")
+        print("\n".join("  " + line for line in (proc.stdout + proc.stderr).strip().splitlines()) + "\n")
+        return
+    after = _ytdlp_installed()
+    print(f"yt-dlp: {before} (already the latest)\n" if after == before else f"yt-dlp: upgraded {before} -> {after}\n")
+
+
+def ytdlp_update_hint() -> str | None:
+    from ytdlp_age import ytdlp_update_hint as hint  # lazy: imports yt_dlp
+    return hint()
+
+
 def _read_env(path: Path | None = None) -> dict[str, str]:
     """KEY=VALUE lines from .env (comments, blank lines and surrounding quotes ignored)."""
     env: dict[str, str] = {}
@@ -776,9 +823,10 @@ def _alert_text(
     text only. Never usernames, links, slugs, track names or error messages, since the
     text goes through a third-party server.
 
-    Tracks that failed inside a playlist that otherwise synced (geo-blocked etc.) and
-    playlists that are empty on SoundCloud are listed but still count as a success;
-    "action needed" is for playlists that didn't sync."""
+    Tracks that failed inside a playlist that otherwise synced (geo-blocked etc.),
+    playlists that are empty on SoundCloud and stale links (a warning line: the user
+    pastes a fresh link when they get to it) are listed but still count as a success;
+    "action needed" is for playlists that didn't sync or need a manual full sync."""
     lines: list[str] = []
     n = result.downloaded
     if n:
@@ -786,6 +834,10 @@ def _alert_text(
         lines += _per_playlist(result.new_tracks, result, line_of)
     else:
         lines.append("No new tracks")
+    if result.yt_recovered:
+        k = sum(result.yt_recovered.values())
+        lines.append(f"{k} track{_s(k)} downloaded from YouTube instead ([YT] files):")
+        lines += _per_playlist(result.yt_recovered, result, line_of)
     if result.track_errors:
         k = sum(result.track_errors.values())
         lines.append(f"{k} track{_s(k)} couldn't be downloaded (see logs):")
@@ -796,7 +848,7 @@ def _alert_text(
     if result.empty:
         lines.append(f"Empty playlist: {_lines_label(result.empty, line_of)} - synced OK, nothing to download")
     if result.stale:
-        lines.append(f"Stale link: {_lines_label(result.stale, line_of)} - paste a fresh share link")
+        lines.append(f"Warning: stale link on {_lines_label(result.stale, line_of)} - paste a fresh share link")
     if result.needs_full:
         nums = " ".join(str(n) for n in sorted({line_of[u] for u in result.needs_full if u in line_of}))
         cmd = f" - python src/sync_sc_playlists.py --force-all --only {nums}" if nums else ""
@@ -810,21 +862,23 @@ def _alert_text(
     if ytdlp_hint and (result.failed or result.track_errors):
         lines.append(ytdlp_hint)
 
-    attention = bool(result.stale or result.needs_full or result.failed or ffmpeg_missing)
+    attention = bool(result.needs_full or result.failed or ffmpeg_missing)
     title = "SC sync: action needed" if attention else "SC sync: success"
-    tags = "warning" if attention else ("musical_note" if result.downloaded else "white_check_mark")
+    new_music = result.downloaded or result.yt_recovered
+    tags = "warning" if attention else ("musical_note" if new_music else "white_check_mark")
     return title, "\n".join(lines), tags
 
 
-def _load_last_run() -> tuple[set[str], set[str], set[str], set[str]]:
+def _load_last_run() -> tuple[set[str], set[str], set[str], set[str], set[str]]:
     """(failed playlists, playlists with failed tracks, empty playlists, failed
-    dl-audio.md / dl-video.md links) from the last unattended run."""
+    dl-audio.md / dl-video.md links, stale links) from the last unattended run."""
     try:
         data = json.loads(LAST_RUN_FILE.read_text(encoding="utf-8"))
         return (set(data.get("failed", [])), set(data.get("track_errors", [])),
-                set(data.get("empty", [])), set(data.get("queue_failed", [])))
+                set(data.get("empty", [])), set(data.get("queue_failed", [])),
+                set(data.get("stale", [])))
     except Exception:
-        return set(), set(), set(), set()
+        return set(), set(), set(), set(), set()
 
 
 def _alert_result(result: RunResult, ran: list[str], ffmpeg_missing: bool) -> None:
@@ -833,24 +887,28 @@ def _alert_result(result: RunResult, ran: list[str], ffmpeg_missing: bool) -> No
     when the set of failing playlists (among those run) changed since last time.
     Same for playlists with failed tracks (a geo-blocked track fails every day).
     An empty playlist alerts on the run it becomes empty, not while it stays empty.
-    Same for links in dl-audio.md / dl-video.md that keep failing."""
-    prev_failed, prev_tracks, prev_empty, prev_queue = _load_last_run()
+    Same for a stale link (it stays listed in alerts sent for other reasons) and for
+    links in dl-audio.md / dl-video.md that keep failing."""
+    prev_failed, prev_tracks, prev_empty, prev_queue, prev_stale = _load_last_run()
     ran_set = set(ran)
     now_failed, now_tracks, now_empty = set(result.failed), set(result.track_errors), set(result.empty)
+    now_stale = set(result.stale)
     # a crash leaves the download lists' state unknown: assume it's what it was
     now_queue = prev_queue if result.queue_crashed else result.queue_failed
     failures_changed = ((prev_failed & ran_set) != now_failed or (prev_tracks & ran_set) != now_tracks
                         or prev_queue != now_queue)
     newly_empty = bool(now_empty - prev_empty)
+    newly_stale = bool(now_stale - prev_stale)
     with contextlib.suppress(OSError):
         LAST_RUN_FILE.write_text(json.dumps({
             "failed": sorted((prev_failed - ran_set) | now_failed),
             "track_errors": sorted((prev_tracks - ran_set) | now_tracks),
             "empty": sorted((prev_empty - ran_set) | now_empty),
+            "stale": sorted((prev_stale - ran_set) | now_stale),
             "queue_failed": sorted(now_queue),
         }), encoding="utf-8")
 
-    if not (result.downloaded or result.stale or result.needs_full or ffmpeg_missing
+    if not (result.downloaded or result.yt_recovered or newly_stale or result.needs_full or ffmpeg_missing
             or failures_changed or newly_empty or result.queue_done or result.queue_crashed):
         print("[notify] nothing new — no alert.")
         return
@@ -891,6 +949,7 @@ def main():
 
     ffmpeg_missing = _log_header()
     try:
+        _upgrade_ytdlp()
         code = _run(args, ffmpeg_missing=ffmpeg_missing)
     except Exception as e:
         traceback.print_exc()
@@ -926,6 +985,7 @@ def _run(args, ffmpeg_missing: bool = False) -> int:
                 unattended=args.unattended,
             )
             if args.unattended:
+                _run_youtube_recovery(result)
                 _run_queues(result)
                 _alert_result(result, remaining, ffmpeg_missing)
             return _finalize(result, unattended=args.unattended)
@@ -961,6 +1021,7 @@ def _run(args, ffmpeg_missing: bool = False) -> int:
         track_state=True, unattended=args.unattended,
     )
     if args.unattended:
+        _run_youtube_recovery(result)
         _run_queues(result)
         _alert_result(result, to_run, ffmpeg_missing)
     return _finalize(result, unattended=args.unattended)
@@ -998,15 +1059,72 @@ def _failed_playlist_stems(urls: list[str]) -> list[str]:
     return stems
 
 
+RETRY_SCRIPT = _ROOT / "src" / "retry_failed_with_ytdl.py"
+
+
 def _run_youtube_retry(urls: list[str]) -> None:
     stems = _failed_playlist_stems(urls)
     if not stems:
         print("\nNo track-level failures to recover via YouTube.")
         return
-    script = _ROOT / "src" / "retry_failed_with_ytdl.py"
     for stem in stems:
         print(f"\n--- {stem} ---")
-        subprocess.run([sys.executable, str(script), stem], check=False)
+        subprocess.run([sys.executable, str(RETRY_SCRIPT), stem], check=False)
+
+
+def _fail_count(url: str) -> int:
+    """[FAIL] entries in the playlist's .failed file (0 if there is none)."""
+    try:
+        text = archive_path(url).with_suffix(".failed").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return 0
+    return len(_FAIL_TAG_RE.findall(text))
+
+
+def _recover_via_youtube(result: RunResult, write=print) -> None:
+    """Scheduled runs: try YouTube for the [FAIL] tracks (DRM-protected, GO+ previews)
+    of the playlists that synced with failed tracks, as a manual run does at the end.
+
+    retry_failed_with_ytdl.py (through ytdl.py) downloads the top YouTube match into the
+    playlist folder as "[YT] <name>", records the SoundCloud id in the archive so the
+    sync stops trying it, and drops the entry from .failed: [FAIL] entries gone from
+    .failed count as recovered. Playlists that didn't sync are left out (offline?)."""
+    write("\n--- YouTube retry of failed tracks ---")
+    urls = [u for u in result.track_errors if _fail_count(u)]
+    if not urls:
+        write("Nothing to retry.")
+        return
+    for u in urls:
+        before = _fail_count(u)
+        write(f"\n[{result.titles.get(u) or _label(u)}] {before} track(s)")
+        proc = subprocess.Popen(
+            [sys.executable, str(RETRY_SCRIPT), archive_path(u).stem],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, encoding="utf-8", errors="replace", cwd=_ROOT,
+            env={**os.environ, "PYTHONIOENCODING": "utf-8:backslashreplace"},
+        )
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            if line.strip():
+                write("  " + line.rstrip())
+        proc.wait()
+        recovered = max(before - _fail_count(u), 0)
+        write(f"  → {recovered} of {before} downloaded from YouTube")
+        if recovered:
+            result.yt_recovered[u] = recovered
+            left = result.track_errors[u] - recovered
+            if left > 0:
+                result.track_errors[u] = left
+            else:
+                del result.track_errors[u]
+
+
+def _run_youtube_recovery(result: RunResult) -> None:
+    """_recover_via_youtube, logged; a crash there never stops the run."""
+    try:
+        _recover_via_youtube(result)
+    except Exception:
+        traceback.print_exc()
 
 
 def _report_stale(stale: list[str]) -> None:
@@ -1042,8 +1160,8 @@ def _report_needs_full(needs_full: list[str]) -> None:
 
 def _finalize(result: RunResult, unattended: bool = False) -> int:
     """Print the end-of-run report. Returns the exit code: 0 success (tracks may have
-    failed inside playlists that otherwise synced, playlists may be empty), 1 needs
-    attention."""
+    failed inside playlists that otherwise synced, playlists may be empty, links may
+    be stale), 1 needs attention (a playlist failed or needs a manual full sync)."""
     removed = delete_empty(ARCHIVE_DIR)
     if removed:
         print(f"\nRemoved {len(removed)} empty file(s) from archive_trackers/sc.")
@@ -1061,6 +1179,11 @@ def _finalize(result: RunResult, unattended: bool = False) -> int:
         _report_stale(result.stale)
     if result.needs_full:
         _report_needs_full(result.needs_full)
+    if result.yt_recovered:
+        k = sum(result.yt_recovered.values())
+        print(f"\n{k} track(s) downloaded from YouTube instead (\"[YT] ...\" files, the top search match):")
+        for u, n in result.yt_recovered.items():
+            print(f"  {name(u)}: {n}")
     if result.track_errors:
         k = sum(result.track_errors.values())
         print(f"\n{k} track(s) couldn't be downloaded (geo-blocked, GO+ only, removed, ...). The playlists themselves synced:")
@@ -1072,15 +1195,17 @@ def _finalize(result: RunResult, unattended: bool = False) -> int:
             print(f"  {u}")
 
     retry = result.failed + list(result.track_errors)
-    if retry and unattended:
-        print("\nTo try recovering failed tracks via YouTube, run: python src/retry_failed_with_ytdl.py --all")
+    if unattended:
+        # YouTube was already tried for the playlists that synced (_recover_via_youtube).
+        if result.failed:
+            print("\nTo try recovering failed tracks via YouTube, run: python src/retry_failed_with_ytdl.py --all")
     elif retry:
         print("\nTrying to recover failed tracks via YouTube...")
         _run_youtube_retry(retry)
 
-    attention = bool(result.stale or result.needs_full or result.failed)
+    attention = bool(result.needs_full or result.failed)
     if not result.failed:
-        print("\nAll done." if not attention else "\nDone — see the playlist(s) above.")
+        print("\nDone — see the playlist(s) above." if attention or result.stale else "\nAll done.")
         _clear_state()
     return 1 if attention else 0
 
